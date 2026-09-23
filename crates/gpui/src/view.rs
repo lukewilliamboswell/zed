@@ -794,6 +794,11 @@ mod cache_tests {
         let parent = root.read_with(cx, |root, _| root.parent.clone());
         let first = parent.read_with(cx, |parent, _| parent.children[0].clone());
         let counts = || (a.get(), b.get(), parent_count.get());
+        let work = Rc::new(Cell::new(crate::FrameWork::default()));
+        cx.update(|window, _| {
+            let work = work.clone();
+            window.observe_frame_work(move |frame| work.set(frame));
+        });
 
         // A dirty parent with unchanged geometry reuses its clean children in place.
         let before = counts();
@@ -801,6 +806,15 @@ mod cache_tests {
         cx.run_until_parked();
         assert_eq!(counts(), (before.0, before.1, before.2 + 1));
         cx.update(|window, _| assert_eq!(window.rendered_frame.cached_view_replay_count(), 0));
+        let frame = work.get();
+        assert_eq!(
+            frame.cached_prepaint_subtrees, 2,
+            "both leaves replay prepaint"
+        );
+        assert_eq!(frame.cached_paint_subtrees, 2, "both leaves replay paint");
+        assert_eq!(frame.replayed_hitboxes, 2);
+        assert_eq!(frame.replayed_scene_operations, 2);
+        assert_eq!(frame.view_states_rebased_prepaint, 0);
 
         // Preceding siblings move the replayed parent; an aborted replay
         // transaction must not leave relocation records behind.
@@ -811,6 +825,27 @@ mod cache_tests {
         });
         cx.run_until_parked();
         cx.update(|window, _| assert!(window.rendered_frame.cached_view_replay_count() > 0));
+        let frame = work.get();
+        assert_eq!(
+            frame.fresh_hitboxes, 3,
+            "only the new prefix is built afresh"
+        );
+        assert_eq!(
+            frame.cached_prepaint_subtrees, 2,
+            "the parent, plus the aborted replay"
+        );
+        assert_eq!(frame.cached_paint_subtrees, 1);
+        assert_eq!(frame.replayed_scene_operations, 2);
+        assert_eq!(
+            frame.view_states_rebased_prepaint, 2,
+            "both nested leaves move"
+        );
+        assert_eq!(frame.view_states_rebased_paint, 2);
+        assert_eq!(
+            frame.counts().len(),
+            crate::FrameWork::METRIC_NAMES.len(),
+            "every counter is named"
+        );
 
         // The children were skipped inside the replayed parent; their ranges must
         // have followed it for this rebuild to reuse them correctly.

@@ -1007,6 +1007,85 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    frame_work: FrameWork,
+}
+
+/// Deterministic work GPUI performed while constructing one frame: what it
+/// built afresh and what it replayed from cached views of the previous frame.
+///
+/// Counts are exact and independent of timing. Observe them with
+/// [`Window::observe_frame_work`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameWork {
+    pub(crate) cached_prepaint_subtrees: u64,
+    pub(crate) replayed_hitboxes: u64,
+    pub(crate) replayed_dispatch_nodes: u64,
+    pub(crate) replayed_deferred_draws: u64,
+    pub(crate) replayed_prepaint_element_states: u64,
+    pub(crate) cached_paint_subtrees: u64,
+    pub(crate) replayed_scene_operations: u64,
+    pub(crate) replayed_mouse_listeners: u64,
+    pub(crate) replayed_input_handlers: u64,
+    pub(crate) replayed_cursor_styles: u64,
+    pub(crate) replayed_paint_element_states: u64,
+    pub(crate) replayed_tab_stops: u64,
+    pub(crate) fresh_hitboxes: u64,
+    pub(crate) fresh_mouse_listeners: u64,
+    pub(crate) fresh_scene_operations: u64,
+    pub(crate) fresh_element_state_accesses: u64,
+    pub(crate) element_states_moved: u64,
+    pub(crate) view_states_rebased_prepaint: u64,
+    pub(crate) view_states_rebased_paint: u64,
+}
+
+impl FrameWork {
+    /// Stable names corresponding to [`Self::counts`].
+    pub const METRIC_NAMES: [&'static str; 19] = [
+        "cached_prepaint_subtrees",
+        "replayed_hitboxes",
+        "replayed_dispatch_nodes",
+        "replayed_deferred_draws",
+        "replayed_prepaint_element_states",
+        "cached_paint_subtrees",
+        "replayed_scene_operations",
+        "replayed_mouse_listeners",
+        "replayed_input_handlers",
+        "replayed_cursor_styles",
+        "replayed_paint_element_states",
+        "replayed_tab_stops",
+        "fresh_hitboxes",
+        "fresh_mouse_listeners",
+        "fresh_scene_operations",
+        "fresh_element_state_accesses",
+        "element_states_moved",
+        "view_states_rebased_prepaint",
+        "view_states_rebased_paint",
+    ];
+
+    /// Every counter, in the order of [`Self::METRIC_NAMES`].
+    pub fn counts(self) -> [u64; 19] {
+        [
+            self.cached_prepaint_subtrees,
+            self.replayed_hitboxes,
+            self.replayed_dispatch_nodes,
+            self.replayed_deferred_draws,
+            self.replayed_prepaint_element_states,
+            self.cached_paint_subtrees,
+            self.replayed_scene_operations,
+            self.replayed_mouse_listeners,
+            self.replayed_input_handlers,
+            self.replayed_cursor_styles,
+            self.replayed_paint_element_states,
+            self.replayed_tab_stops,
+            self.fresh_hitboxes,
+            self.fresh_mouse_listeners,
+            self.fresh_scene_operations,
+            self.fresh_element_state_accesses,
+            self.element_states_moved,
+            self.view_states_rebased_prepaint,
+            self.view_states_rebased_paint,
+        ]
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1141,6 +1220,7 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            frame_work: FrameWork::default(),
         }
     }
 
@@ -1161,6 +1241,7 @@ impl Frame {
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.focus = None;
+        self.frame_work = FrameWork::default();
 
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -1214,7 +1295,10 @@ impl Frame {
         hit_test
     }
 
-    fn push_mouse_listener(&mut self, listener: Option<AnyMouseListener>) {
+    fn push_mouse_listener(&mut self, listener: Option<AnyMouseListener>, replayed: bool) {
+        if !replayed {
+            self.frame_work.fresh_mouse_listeners += 1;
+        }
         let index = self.mouse_listeners.len();
         if let Some(listener) = listener.as_ref() {
             match listener.hitbox_id {
@@ -1274,6 +1358,7 @@ impl Frame {
                 prev_frame.element_states.remove_entry(element_state_key)
             {
                 self.element_states.insert(element_state_key, element_state);
+                self.frame_work.element_states_moved += 1;
             }
         }
 
@@ -1289,6 +1374,7 @@ impl Frame {
         let view_state = TypeId::of::<crate::view::ViewElementState>();
         let mut prepaint_relocated = FxHashSet::default();
         let mut paint_relocated = FxHashSet::default();
+        let frame_work = &mut self.frame_work;
         for replay in &self.cached_view_replays {
             let (start, end, relocated) = match replay {
                 CachedViewReplay::Prepaint {
@@ -1326,10 +1412,12 @@ impl Frame {
                 };
                 match replay {
                     CachedViewReplay::Prepaint { old, new, .. } => {
+                        frame_work.view_states_rebased_prepaint += 1;
                         state.prepaint_range.start.rebase(old, new);
                         state.prepaint_range.end.rebase(old, new);
                     }
                     CachedViewReplay::Paint { old, new, .. } => {
+                        frame_work.view_states_rebased_paint += 1;
                         state.paint_range.start.rebase(old, new);
                         state.paint_range.end.rebase(old, new);
                     }
@@ -1382,6 +1470,7 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    frame_work_observer: Option<Box<dyn Fn(FrameWork)>>,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -2238,6 +2327,7 @@ impl Window {
             focused_text_input_active: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            frame_work_observer: None,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -3444,6 +3534,15 @@ impl Window {
         self.capslock
     }
 
+    /// Observe the deterministic work of each frame this window constructs.
+    ///
+    /// The observer runs once per frame, after the frame is complete and its
+    /// element state has migrated, and before it is presented. It replaces any
+    /// previous observer. Observation does not change caching or rendering.
+    pub fn observe_frame_work(&mut self, observer: impl Fn(FrameWork) + 'static) {
+        self.frame_work_observer = Some(Box::new(observer));
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
@@ -3533,6 +3632,16 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        let (fresh_scene_operations, replayed_scene_operations) =
+            self.next_frame.scene.operation_work();
+        self.next_frame.frame_work.fresh_scene_operations = fresh_scene_operations;
+        debug_assert_eq!(
+            self.next_frame.frame_work.replayed_scene_operations,
+            replayed_scene_operations
+        );
+        if let Some(observer) = &self.frame_work_observer {
+            observer(self.next_frame.frame_work);
+        }
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -4006,6 +4115,16 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        let work = &mut self.next_frame.frame_work;
+        work.cached_prepaint_subtrees += 1;
+        work.replayed_hitboxes += (range.end.hitboxes_index - range.start.hitboxes_index) as u64;
+        work.replayed_dispatch_nodes +=
+            (range.end.dispatch_tree_index - range.start.dispatch_tree_index) as u64;
+        work.replayed_deferred_draws +=
+            (range.end.deferred_draws_index - range.start.deferred_draws_index) as u64;
+        work.replayed_prepaint_element_states += (range.end.accessed_element_states_index
+            - range.start.accessed_element_states_index)
+            as u64;
         let new_start = self.prepaint_index();
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
@@ -4081,6 +4200,20 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        let work = &mut self.next_frame.frame_work;
+        work.cached_paint_subtrees += 1;
+        work.replayed_scene_operations += (range.end.scene_index - range.start.scene_index) as u64;
+        work.replayed_mouse_listeners +=
+            (range.end.mouse_listeners_index - range.start.mouse_listeners_index) as u64;
+        work.replayed_input_handlers +=
+            (range.end.input_handlers_index - range.start.input_handlers_index) as u64;
+        work.replayed_cursor_styles +=
+            (range.end.cursor_styles_index - range.start.cursor_styles_index) as u64;
+        work.replayed_paint_element_states += (range.end.accessed_element_states_index
+            - range.start.accessed_element_states_index)
+            as u64;
+        work.replayed_tab_stops +=
+            (range.end.tab_handle_index - range.start.tab_handle_index) as u64;
         let new_start = self.paint_index();
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
@@ -4105,7 +4238,7 @@ impl Window {
         for listener in &mut self.rendered_frame.mouse_listeners
             [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
         {
-            self.next_frame.push_mouse_listener(listener.take());
+            self.next_frame.push_mouse_listener(listener.take(), true);
         }
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
@@ -5335,6 +5468,7 @@ impl Window {
             behavior,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
+        self.next_frame.frame_work.fresh_hitboxes += 1;
         hitbox
     }
 
@@ -5465,16 +5599,22 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.push_mouse_listener(Some(AnyMouseListener {
-            hitbox_id: None,
-            handler: Box::new(
-                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                    if let Some(event) = event.downcast_ref() {
-                        listener(event, phase, window, cx)
-                    }
-                },
-            ),
-        }));
+        self.next_frame.push_mouse_listener(
+            Some(AnyMouseListener {
+                hitbox_id: None,
+                handler: Box::new(
+                    move |event: &dyn Any,
+                          phase: DispatchPhase,
+                          window: &mut Window,
+                          cx: &mut App| {
+                        if let Some(event) = event.downcast_ref() {
+                            listener(event, phase, window, cx)
+                        }
+                    },
+                ),
+            }),
+            false,
+        );
     }
 
     /// Register a pointer-motion listener that only has an effect while the
@@ -5494,16 +5634,22 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.push_mouse_listener(Some(AnyMouseListener {
-            hitbox_id: Some(hitbox_id),
-            handler: Box::new(
-                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                    if let Some(event) = event.downcast_ref() {
-                        listener(event, phase, window, cx)
-                    }
-                },
-            ),
-        }));
+        self.next_frame.push_mouse_listener(
+            Some(AnyMouseListener {
+                hitbox_id: Some(hitbox_id),
+                handler: Box::new(
+                    move |event: &dyn Any,
+                          phase: DispatchPhase,
+                          window: &mut Window,
+                          cx: &mut App| {
+                        if let Some(event) = event.downcast_ref() {
+                            listener(event, phase, window, cx)
+                        }
+                    },
+                ),
+            }),
+            false,
+        );
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -7376,6 +7522,7 @@ impl Window {
     ) -> ((GlobalElementId, TypeId), Option<ElementStateBox>) {
         let key = (global_id.clone(), state_type);
         self.next_frame.accessed_element_states.push(key.clone());
+        self.next_frame.frame_work.fresh_element_state_accesses += 1;
         let state = self
             .next_frame
             .element_states
