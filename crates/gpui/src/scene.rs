@@ -61,6 +61,9 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     animations: Vec<SpriteAnimation>,
+    fresh_operations: u64,
+    replayed_operations: u64,
+    replaying: bool,
 }
 
 #[expect(missing_docs)]
@@ -79,6 +82,9 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.animations.clear();
+        self.fresh_operations = 0;
+        self.replayed_operations = 0;
+        self.replaying = false;
     }
 
     /// Inserts a sprite that [`Self::advance_animations`] keeps moving. The
@@ -136,6 +142,7 @@ impl Scene {
             max_shared_kind: PrimitiveKind::Surface,
         });
         self.paint_operations.push(PaintOperation::StartLayer);
+        self.note_operation();
     }
 
     pub fn pop_layer(&mut self) {
@@ -146,6 +153,7 @@ impl Scene {
             }
         }
         self.paint_operations.push(PaintOperation::EndLayer);
+        self.note_operation();
     }
 
     fn insert_layer(&mut self, layer: Layer) {
@@ -194,6 +202,7 @@ impl Scene {
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+        self.note_operation();
         true
     }
 
@@ -224,7 +233,22 @@ impl Scene {
         }
     }
 
+    fn note_operation(&mut self) {
+        if self.replaying {
+            self.replayed_operations += 1;
+        } else {
+            self.fresh_operations += 1;
+        }
+    }
+
+    /// Paint operations recorded since the scene was cleared: those painted
+    /// afresh, then those replayed from a previous scene.
+    pub(crate) fn operation_work(&self) -> (u64, u64) {
+        (self.fresh_operations, self.replayed_operations)
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        self.replaying = true;
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => {
@@ -242,6 +266,7 @@ impl Scene {
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
+        self.replaying = false;
     }
 
     pub fn finish(&mut self) {
