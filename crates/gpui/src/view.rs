@@ -45,6 +45,14 @@ impl AnyView {
         ViewElement::new(self).cached(style)
     }
 
+    /// Embed this view as a cached subtree whose children invalidate independently.
+    pub fn cached_with_independent_children(
+        self,
+        style: StyleRefinement,
+    ) -> ViewElement<AnyView> {
+        ViewElement::new(self).cached_with_independent_children(style)
+    }
+
     /// Convert this to a weak handle.
     pub fn downgrade(&self) -> AnyWeakView {
         AnyWeakView {
@@ -251,6 +259,7 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    independent_children: bool,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -263,6 +272,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            independent_children: false,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -280,6 +290,13 @@ impl<V: View> ViewElement<V> {
     /// entity-backed by construction.
     pub(crate) fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style);
+        self.independent_children = false;
+        self
+    }
+
+    pub(crate) fn cached_with_independent_children(mut self, style: StyleRefinement) -> Self {
+        self.cached_style = Some(style);
+        self.independent_children = true;
         self
     }
 }
@@ -297,6 +314,8 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    refresh_descendants: bool,
+    independent_children: bool,
 }
 
 struct ViewElementCacheKey {
@@ -363,6 +382,7 @@ impl<V: View> Element for ViewElement<V> {
             // Stateful path.
             prepaint_view(
                 entity_id,
+                self.independent_children,
                 global_id,
                 bounds,
                 element,
@@ -397,6 +417,7 @@ impl<V: View> Element for ViewElement<V> {
             paint_view(
                 entity_id,
                 self.cached_style.is_some(),
+                self.independent_children,
                 global_id,
                 element,
                 window,
@@ -461,6 +482,7 @@ fn request_layout_component(
 #[inline(never)]
 fn prepaint_view(
     entity_id: EntityId,
+    independent_children: bool,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -481,12 +503,22 @@ fn prepaint_view(
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
 
+                let refresh_descendants = !independent_children
+                    || window.refreshing
+                    || element_state.as_ref().is_none_or(|state| {
+                        state.independent_children != independent_children
+                            || state.cache_key.bounds != bounds
+                            || state.cache_key.content_mask != content_mask
+                            || state.cache_key.text_style != text_style
+                    });
+
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && element_state.independent_children == independent_children
                 {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -498,7 +530,7 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
-                let refreshing = mem::replace(&mut window.refreshing, true);
+                let refreshing = mem::replace(&mut window.refreshing, refresh_descendants);
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
@@ -514,6 +546,8 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        refresh_descendants,
+                        independent_children,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
@@ -545,6 +579,7 @@ fn prepaint_component(
 fn paint_view(
     entity_id: EntityId,
     cached: bool,
+    independent_children: bool,
     global_id: Option<&GlobalElementId>,
     element: &mut Option<AnyElement>,
     window: &mut Window,
@@ -561,7 +596,9 @@ fn paint_view(
                     let paint_start = window.paint_index();
 
                     if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        let refresh_descendants =
+                            !independent_children || window.refreshing || element_state.refresh_descendants;
+                        let refreshing = mem::replace(&mut window.refreshing, refresh_descendants);
                         element.paint(window, cx);
                         window.refreshing = refreshing;
                     } else {
