@@ -2849,18 +2849,21 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = hitbox.is_hovered(window);
-                let was_hovered = hover_state
-                    .as_ref()
-                    .is_some_and(|state| state.borrow().element);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    if let Some(hover_state) = &hover_state {
-                        hover_state.borrow_mut().element = hovered;
-                        cx.notify(current_view);
+            window.on_hitbox_pointer_motion(
+                hitbox.id,
+                move |_: &MouseMoveEvent, phase, window, cx| {
+                    let hovered = hitbox.is_hovered(window);
+                    let was_hovered = hover_state
+                        .as_ref()
+                        .is_some_and(|state| state.borrow().element);
+                    if phase == DispatchPhase::Capture && hovered != was_hovered {
+                        if let Some(hover_state) = &hover_state {
+                            hover_state.borrow_mut().element = hovered;
+                            cx.notify(current_view);
+                        }
                     }
-                }
-            });
+                },
+            );
         }
 
         if let Some(group_hover) = self.group_hover_style.as_ref() {
@@ -2871,18 +2874,21 @@ impl Interactivity {
                     .cloned();
                 let current_view = window.current_view();
 
-                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                    let group_hovered = group_hitbox_id.is_hovered(window);
-                    let was_group_hovered = hover_state
-                        .as_ref()
-                        .is_some_and(|state| state.borrow().group);
-                    if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
-                        if let Some(hover_state) = &hover_state {
-                            hover_state.borrow_mut().group = group_hovered;
-                            cx.notify(current_view);
+                window.on_hitbox_pointer_motion(
+                    group_hitbox_id,
+                    move |_: &MouseMoveEvent, phase, window, cx| {
+                        let group_hovered = group_hitbox_id.is_hovered(window);
+                        let was_group_hovered = hover_state
+                            .as_ref()
+                            .is_some_and(|state| state.borrow().group);
+                        if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
+                            if let Some(hover_state) = &hover_state {
+                                hover_state.borrow_mut().group = group_hovered;
+                                cx.notify(current_view);
+                            }
                         }
-                    }
-                });
+                    },
+                );
             }
         }
 
@@ -2962,7 +2968,7 @@ impl Interactivity {
                     }
                 });
 
-                window.on_mouse_event({
+                window.on_hitbox_pointer_motion(hitbox.id, {
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
@@ -3156,7 +3162,7 @@ impl Interactivity {
                     }
                 }
 
-                window.on_mouse_event({
+                window.on_hitbox_pointer_motion(hitbox.id, {
                     let update_hover = update_hover.clone();
                     let hitbox = hitbox.clone();
                     move |_: &MouseMoveEvent, phase, window, cx| {
@@ -3171,11 +3177,14 @@ impl Interactivity {
 
                 // The pointer can leave the window without a final MouseMove, so also
                 // clear hover on MouseExited.
-                window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Bubble {
-                        update_hover(false, window, cx);
-                    }
-                });
+                window.on_hitbox_pointer_motion(
+                    hitbox.id,
+                    move |_: &MouseExitEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            update_hover(false, window, cx);
+                        }
+                    },
+                );
             }
 
             if let Some(tooltip_builder) = self.tooltip_builder.take() {
@@ -3306,12 +3315,15 @@ impl Interactivity {
         if let Some(group_hitbox) = group_hitbox {
             let was_hovered = group_hitbox.is_hovered(window);
             let current_view = window.current_view();
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = group_hitbox.is_hovered(window);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    cx.notify(current_view);
-                }
-            });
+            window.on_hitbox_pointer_motion(
+                group_hitbox,
+                move |_: &MouseMoveEvent, phase, window, cx| {
+                    let hovered = group_hitbox.is_hovered(window);
+                    if phase == DispatchPhase::Capture && hovered != was_hovered {
+                        cx.notify(current_view);
+                    }
+                },
+            );
         }
     }
 
@@ -5630,5 +5642,120 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
+    }
+}
+
+#[cfg(test)]
+mod pointer_routing_tests {
+    use crate::{
+        AppContext as _, Context, InteractiveElement, IntoElement, Modifiers, MouseButton,
+        MouseExitEvent, ParentElement, Render, StatefulInteractiveElement, Styled, TestAppContext,
+        Window, div, point, px,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    const CELLS: usize = 100;
+
+    struct Row {
+        edges: Rc<RefCell<Vec<(usize, bool)>>>,
+        moves: Rc<RefCell<usize>>,
+        dragged: Rc<RefCell<usize>>,
+    }
+
+    struct Dragged;
+
+    impl Render for Dragged {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl Render for Row {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let moves = self.moves.clone();
+            div()
+                .id("row")
+                .flex()
+                .on_mouse_move(move |_, _, _| *moves.borrow_mut() += 1)
+                .children((0..CELLS).map(|index| {
+                    let edges = self.edges.clone();
+                    let dragged = self.dragged.clone();
+                    div()
+                        .id(index)
+                        .w(px(10.))
+                        .h(px(10.))
+                        .hover(|style| style.opacity(0.5))
+                        .on_hover(move |hovered, _, _| edges.borrow_mut().push((index, *hovered)))
+                        .on_drag(index, move |_, _, _, cx| {
+                            *dragged.borrow_mut() += 1;
+                            cx.new(|_| Dragged)
+                        })
+                }))
+        }
+    }
+
+    #[crate::test]
+    fn free_pointer_motion_reaches_only_the_hitboxes_it_crosses(cx: &mut TestAppContext) {
+        let edges = Rc::new(RefCell::new(Vec::new()));
+        let moves = Rc::new(RefCell::new(0));
+        let dragged = Rc::new(RefCell::new(0));
+        let (_, cx) = cx.add_window_view(|_, _| Row {
+            edges: edges.clone(),
+            moves: moves.clone(),
+            dragged: dragged.clone(),
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_move(point(px(-10.), px(-10.)), None, Modifiers::none());
+        edges.borrow_mut().clear();
+        *moves.borrow_mut() = 0;
+
+        cx.simulate_mouse_move(point(px(5.), px(5.)), None, Modifiers::none());
+        cx.simulate_mouse_move(point(px(15.), px(5.)), None, Modifiers::none());
+        assert_eq!(*edges.borrow(), [(0, true), (1, true), (0, false)]);
+
+        // Hovering one cell among many visits only its own listeners, the
+        // cells the move crossed, and listeners that are not owned by a hitbox.
+        cx.update(|window, _| {
+            let frame = &window.rendered_frame;
+            let routed = frame.pointer_motion_listeners(&window.mouse_hit_test.ids);
+            let owned: usize = frame.hitbox_mouse_listeners.values().map(|l| l.len()).sum();
+            assert!(owned >= CELLS * 3, "each cell owns its motion listeners");
+            assert_eq!(
+                routed.len(),
+                frame.mouse_listeners.len() - owned
+                    + frame.hitbox_mouse_listeners[&window.mouse_hit_test.ids[0]].len()
+            );
+            assert!(routed.windows(2).all(|pair| pair[0] < pair[1]));
+        });
+
+        // Leaving the window, even at the last position inside it, ends hover once.
+        cx.simulate_event(MouseExitEvent {
+            position: point(px(15.), px(5.)),
+            pressed_button: None,
+            modifiers: Modifiers::none(),
+        });
+        assert_eq!(
+            *edges.borrow(),
+            [(0, true), (1, true), (0, false), (1, false)]
+        );
+        cx.simulate_mouse_move(point(px(15.), px(5.)), None, Modifiers::none());
+        assert_eq!(edges.borrow().last(), Some(&(1, true)));
+
+        // Unowned listeners still observe every move.
+        assert_eq!(*moves.borrow(), 3);
+
+        // Pressed motion reaches the pressed element even far from it.
+        cx.simulate_mouse_down(point(px(15.), px(5.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(px(500.), px(5.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        assert_eq!(*dragged.borrow(), 1);
+        cx.simulate_mouse_up(
+            point(px(500.), px(5.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
     }
 }

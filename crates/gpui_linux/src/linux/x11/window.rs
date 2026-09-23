@@ -1968,6 +1968,14 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().renderer.gpu_specs().into()
     }
 
+    fn request_frame_capture(&self) -> bool {
+        self.0.state.borrow_mut().renderer.request_frame_capture()
+    }
+
+    fn take_captured_frame(&self) -> Option<gpui::CapturedFrame> {
+        self.0.state.borrow_mut().renderer.take_captured_frame()
+    }
+
     fn play_system_bell(&self) {
         // Volume 0% means don't increase or decrease from system volume
         let _ = self.0.xcb.bell(0);

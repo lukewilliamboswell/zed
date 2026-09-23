@@ -45,6 +45,11 @@ impl AnyView {
         ViewElement::new(self).cached(style)
     }
 
+    /// Embed this view as a cached subtree whose children invalidate independently.
+    pub fn cached_with_independent_children(self, style: StyleRefinement) -> ViewElement<AnyView> {
+        ViewElement::new(self).cached_with_independent_children(style)
+    }
+
     /// Convert this to a weak handle.
     pub fn downgrade(&self) -> AnyWeakView {
         AnyWeakView {
@@ -251,6 +256,7 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    independent_children: bool,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -263,6 +269,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            independent_children: false,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -280,6 +287,13 @@ impl<V: View> ViewElement<V> {
     /// entity-backed by construction.
     pub(crate) fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style);
+        self.independent_children = false;
+        self
+    }
+
+    pub(crate) fn cached_with_independent_children(mut self, style: StyleRefinement) -> Self {
+        self.cached_style = Some(style);
+        self.independent_children = true;
         self
     }
 }
@@ -292,11 +306,13 @@ impl<V: View> IntoElement for ViewElement<V> {
     }
 }
 
-struct ViewElementState {
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
+pub(crate) struct ViewElementState {
+    pub(crate) prepaint_range: Range<PrepaintStateIndex>,
+    pub(crate) paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    refresh_descendants: bool,
+    independent_children: bool,
 }
 
 struct ViewElementCacheKey {
@@ -363,6 +379,7 @@ impl<V: View> Element for ViewElement<V> {
             // Stateful path.
             prepaint_view(
                 entity_id,
+                self.independent_children,
                 global_id,
                 bounds,
                 element,
@@ -397,6 +414,7 @@ impl<V: View> Element for ViewElement<V> {
             paint_view(
                 entity_id,
                 self.cached_style.is_some(),
+                self.independent_children,
                 global_id,
                 element,
                 window,
@@ -461,6 +479,7 @@ fn request_layout_component(
 #[inline(never)]
 fn prepaint_view(
     entity_id: EntityId,
+    independent_children: bool,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -481,12 +500,22 @@ fn prepaint_view(
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
 
+                let refresh_descendants = !independent_children
+                    || window.refreshing
+                    || element_state.as_ref().is_none_or(|state| {
+                        state.independent_children != independent_children
+                            || state.cache_key.bounds != bounds
+                            || state.cache_key.content_mask != content_mask
+                            || state.cache_key.text_style != text_style
+                    });
+
                 if let Some(mut element_state) = element_state
                     && element_state.cache_key.bounds == bounds
                     && element_state.cache_key.content_mask == content_mask
                     && element_state.cache_key.text_style == text_style
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && element_state.independent_children == independent_children
                 {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -498,7 +527,7 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
-                let refreshing = mem::replace(&mut window.refreshing, true);
+                let refreshing = mem::replace(&mut window.refreshing, refresh_descendants);
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
@@ -514,6 +543,8 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        refresh_descendants,
+                        independent_children,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
@@ -545,6 +576,7 @@ fn prepaint_component(
 fn paint_view(
     entity_id: EntityId,
     cached: bool,
+    independent_children: bool,
     global_id: Option<&GlobalElementId>,
     element: &mut Option<AnyElement>,
     window: &mut Window,
@@ -561,7 +593,10 @@ fn paint_view(
                     let paint_start = window.paint_index();
 
                     if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        let refresh_descendants = !independent_children
+                            || window.refreshing
+                            || element_state.refresh_descendants;
+                        let refreshing = mem::replace(&mut window.refreshing, refresh_descendants);
                         element.paint(window, cx);
                         window.refreshing = refreshing;
                     } else {
@@ -590,4 +625,310 @@ fn paint_component(
     window.with_id(ElementId::Name(name.into()), |window| {
         element.as_mut().unwrap().paint(window, cx);
     });
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::{
+        AppContext, Context, Entity, InteractiveElement, IntoElement, Modifiers, ParentElement,
+        Render, StatefulInteractiveElement, Styled, TestAppContext, canvas, div, point, px, rgb,
+    };
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct Leaf {
+        renders: Rc<Cell<u64>>,
+        entered: Rc<Cell<u64>>,
+    }
+
+    impl Render for Leaf {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let entered = self.entered.clone();
+            div()
+                .id("leaf")
+                .w(px(20.0))
+                .h(px(20.0))
+                .bg(rgb(0x123456))
+                .on_hover(move |hovered, _, _| {
+                    if *hovered {
+                        entered.set(entered.get() + 1);
+                    }
+                })
+        }
+    }
+
+    struct Parent {
+        children: Vec<Entity<Leaf>>,
+        renders: Rc<Cell<u64>>,
+        color: u32,
+    }
+
+    impl Render for Parent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .flex()
+                .text_color(rgb(self.color))
+                .children(self.children.iter().cloned().map(|child| {
+                    let mut layout = div().w(px(20.0)).h(px(20.0));
+                    AnyView::from(child).cached_with_independent_children(layout.style().clone())
+                }))
+        }
+    }
+
+    struct Root {
+        parent: Entity<Parent>,
+        width: f32,
+        independent: bool,
+        clip_width: f32,
+        prefix: usize,
+        abort_replay: bool,
+    }
+
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let view = AnyView::from(self.parent.clone());
+            let mut layout = div().w(px(self.width)).h(px(20.0));
+            let child = if self.independent {
+                view.cached_with_independent_children(layout.style().clone())
+            } else {
+                view.cached(layout.style().clone())
+            };
+            let abort_replay = self.abort_replay;
+            let parent_id = self.parent.entity_id();
+            div()
+                .w(px(self.clip_width))
+                .h(px(20.0))
+                .overflow_hidden()
+                .children((0..self.prefix).map(|i| {
+                    div()
+                        .id(i)
+                        .absolute()
+                        .w(px(1.0))
+                        .h(px(1.0))
+                        .bg(rgb(0x654321))
+                        .on_hover(|_, _, _| {})
+                }))
+                .child(
+                    canvas(
+                        move |_, window, _| {
+                            if !abort_replay {
+                                return;
+                            }
+                            // Replay the cached parent inside a transaction that
+                            // rolls back: its relocation records must not survive.
+                            let range = window
+                                .rendered_frame
+                                .element_states
+                                .iter()
+                                .find_map(|(key, state)| {
+                                    (key.0.0.last() == Some(&ElementId::View(parent_id)))
+                                        .then(|| {
+                                            state
+                                                .inner
+                                                .downcast_ref::<Option<ViewElementState>>()
+                                                .and_then(Option::as_ref)
+                                                .map(|state| state.prepaint_range.clone())
+                                        })
+                                        .flatten()
+                                })
+                                .expect("cached parent state");
+                            assert!(
+                                window
+                                    .transact(|window| {
+                                        window.reuse_prepaint(range);
+                                        Err::<(), ()>(())
+                                    })
+                                    .is_err()
+                            );
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .w(px(0.0))
+                    .h(px(0.0)),
+                )
+                .child(child)
+        }
+    }
+
+    #[crate::test]
+    fn dirty_cached_parent_preserves_clean_children_but_geometry_and_refresh_rebuild(
+        cx: &mut TestAppContext,
+    ) {
+        let a = Rc::new(Cell::new(0));
+        let b = Rc::new(Cell::new(0));
+        let parent_count = Rc::new(Cell::new(0));
+        let entered_a = Rc::new(Cell::new(0));
+        let entered_b = Rc::new(Cell::new(0));
+        let (root, cx) = cx.add_window_view(|_, cx| {
+            let first = cx.new(|_| Leaf {
+                renders: a.clone(),
+                entered: entered_a.clone(),
+            });
+            let second = cx.new(|_| Leaf {
+                renders: b.clone(),
+                entered: entered_b.clone(),
+            });
+            let parent = cx.new(|_| Parent {
+                children: vec![first, second],
+                renders: parent_count.clone(),
+                color: 0,
+            });
+            Root {
+                parent,
+                width: 100.0,
+                independent: true,
+                clip_width: 200.0,
+                prefix: 0,
+                abort_replay: false,
+            }
+        });
+        cx.run_until_parked();
+        let outside = point(px(-10.0), px(-10.0));
+        cx.simulate_mouse_move(outside, None, Modifiers::none());
+        entered_a.set(0);
+        entered_b.set(0);
+        let parent = root.read_with(cx, |root, _| root.parent.clone());
+        let first = parent.read_with(cx, |parent, _| parent.children[0].clone());
+        let counts = || (a.get(), b.get(), parent_count.get());
+        let work = Rc::new(Cell::new(crate::FrameWork::default()));
+        cx.update(|window, _| {
+            let work = work.clone();
+            window.observe_frame_work(move |frame| work.set(frame));
+        });
+
+        // A dirty parent with unchanged geometry reuses its clean children in place.
+        let before = counts();
+        parent.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0, before.1, before.2 + 1));
+        cx.update(|window, _| assert_eq!(window.rendered_frame.cached_view_replay_count(), 0));
+        let frame = work.get();
+        assert_eq!(
+            frame.cached_prepaint_subtrees, 2,
+            "both leaves replay prepaint"
+        );
+        assert_eq!(frame.cached_paint_subtrees, 2, "both leaves replay paint");
+        assert_eq!(frame.replayed_hitboxes, 2);
+        assert_eq!(frame.replayed_scene_operations, 2);
+        assert_eq!(frame.view_states_rebased_prepaint, 0);
+
+        // Preceding siblings move the replayed parent; an aborted replay
+        // transaction must not leave relocation records behind.
+        root.update(cx, |root, cx| {
+            root.prefix = 3;
+            root.abort_replay = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(window.rendered_frame.cached_view_replay_count() > 0));
+        let frame = work.get();
+        assert_eq!(
+            frame.fresh_hitboxes, 3,
+            "only the new prefix is built afresh"
+        );
+        assert_eq!(
+            frame.cached_prepaint_subtrees, 2,
+            "the parent, plus the aborted replay"
+        );
+        assert_eq!(frame.cached_paint_subtrees, 1);
+        assert_eq!(frame.replayed_scene_operations, 2);
+        assert_eq!(
+            frame.view_states_rebased_prepaint, 2,
+            "both nested leaves move"
+        );
+        assert_eq!(frame.view_states_rebased_paint, 2);
+        assert_eq!(
+            frame.counts().len(),
+            crate::FrameWork::METRIC_NAMES.len(),
+            "every counter is named"
+        );
+
+        // The children were skipped inside the replayed parent; their ranges must
+        // have followed it for this rebuild to reuse them correctly.
+        let before = counts();
+        parent.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0, before.1, before.2 + 1));
+
+        // A descendant notification after parent reuse still reaches its ancestor.
+        let before = counts();
+        first.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0 + 1, before.1, before.2 + 1));
+        cx.simulate_mouse_move(point(px(5.0), px(5.0)), None, Modifiers::none());
+        cx.simulate_mouse_move(point(px(25.0), px(5.0)), None, Modifiers::none());
+        assert_eq!((entered_a.get(), entered_b.get()), (1, 1));
+        cx.update(|window, _| assert_eq!(window.rendered_frame.scene.quads.len(), 5));
+
+        // Shrinking the preceding siblings relocates in the other direction.
+        root.update(cx, |root, cx| {
+            root.prefix = 0;
+            root.abort_replay = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        parent.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(point(px(5.0), px(5.0)), None, Modifiers::none());
+        assert_eq!((entered_a.get(), entered_b.get()), (2, 1));
+        cx.update(|window, _| assert_eq!(window.rendered_frame.scene.quads.len(), 2));
+
+        // Geometry, explicit refresh, inherited text style, and clipping rebuild children.
+        let before = counts();
+        root.update(cx, |root, cx| {
+            root.width = 120.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0 + 1, before.1 + 1, before.2 + 1));
+        let before = counts();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0 + 1, before.1 + 1, before.2 + 1));
+        let before = counts();
+        parent.update(cx, |parent, cx| {
+            parent.color = 0xabcdef;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0 + 1, before.1 + 1, before.2 + 1));
+        let before = counts();
+        root.update(cx, |root, cx| {
+            root.clip_width = 50.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0 + 1, before.1 + 1, before.2 + 1));
+
+        // Policy changes invalidate existing caches; ordinary caching stays conservative.
+        let before = counts();
+        root.update(cx, |root, cx| {
+            root.independent = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0 + 1, before.1 + 1, before.2 + 1));
+        let before = counts();
+        parent.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0 + 1, before.1 + 1, before.2 + 1));
+        root.update(cx, |root, cx| {
+            root.independent = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Removing a cached child retires its replay range; the survivor moves.
+        let before = counts();
+        parent.update(cx, |parent, cx| {
+            parent.children.remove(0);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(counts(), (before.0, before.1 + 1, before.2 + 1));
+    }
 }

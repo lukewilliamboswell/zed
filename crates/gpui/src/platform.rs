@@ -1030,6 +1030,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
+    /// Ask the renderer to read back the next frame it presents. Returns
+    /// whether this window's renderer can do so.
+    fn request_frame_capture(&self) -> bool {
+        false
+    }
+
+    /// The frame read back after [`Self::request_frame_capture`], once it has
+    /// been presented.
+    fn take_captured_frame(&self) -> Option<CapturedFrame> {
+        None
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     // Mobile platform methods.
@@ -1087,6 +1099,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+}
+
+/// The pixels of one presented frame, read back from the window's own surface.
+#[derive(Clone, Debug)]
+pub struct CapturedFrame {
+    /// Width in device pixels.
+    pub width: u32,
+    /// Height in device pixels.
+    pub height: u32,
+    /// Row-major RGBA, eight bits per channel, exactly as presented: the
+    /// surface's colour encoding and alpha mode are not converted.
+    pub rgba: Vec<u8>,
 }
 
 /// A renderer for headless windows that can produce real rendered output.

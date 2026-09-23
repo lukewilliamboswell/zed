@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, CapturedFrame, DevicePixels, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -239,6 +239,11 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Whether the surface can be a copy source, so presented frames can be read back.
+    supports_frame_capture: bool,
+    /// The next presented frame is copied back to the CPU.
+    capture_requested: bool,
+    captured_frame: Option<CapturedFrame>,
 }
 
 impl WgpuRenderer {
@@ -419,6 +424,7 @@ impl WgpuRenderer {
             );
         }
 
+        let supports_frame_capture = surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -613,6 +619,125 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            supports_frame_capture,
+            capture_requested: false,
+            captured_frame: None,
+        })
+    }
+
+    /// Read back the next presented frame. The surface gains copy-source usage
+    /// the first time this is asked, so windows that never capture keep a
+    /// presentation-only swapchain. Returns false when the surface cannot be
+    /// a copy source.
+    pub fn request_frame_capture(&mut self) -> bool {
+        if !self.supports_frame_capture || self.resources.is_none() {
+            return false;
+        }
+        if !self
+            .surface_config
+            .usage
+            .contains(wgpu::TextureUsages::COPY_SRC)
+        {
+            self.surface_config.usage |= wgpu::TextureUsages::COPY_SRC;
+            if self.surface_configured {
+                let surface_config = self.surface_config.clone();
+                let resources = self.resources_mut();
+                resources
+                    .surface
+                    .configure(&resources.device, &surface_config);
+            }
+        }
+        self.captured_frame = None;
+        self.capture_requested = true;
+        true
+    }
+
+    /// The frame read back after [`Self::request_frame_capture`], if one has
+    /// been presented since.
+    pub fn take_captured_frame(&mut self) -> Option<CapturedFrame> {
+        self.captured_frame.take()
+    }
+
+    /// Copy the rendered surface texture to the CPU. This waits for the GPU;
+    /// it runs only for a frame someone asked to photograph.
+    fn read_back_frame(&self, texture: &wgpu::Texture) -> Result<CapturedFrame> {
+        let resources = self.resources();
+        let width = texture.width();
+        let height = texture.height();
+        let unpadded_bytes_per_row = width * 4;
+        let bytes_per_row = unpadded_bytes_per_row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frame_capture"),
+            size: u64::from(bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder =
+            resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("frame_capture_encoder"),
+                });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = resources.queue.submit(std::iter::once(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).ok();
+        });
+        resources
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .context("waiting for frame capture")?;
+        receiver
+            .recv()
+            .context("frame capture mapping was dropped")?
+            .context("mapping frame capture")?;
+        let swap_red_blue = matches!(
+            texture.format(),
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut rgba = Vec::with_capacity(unpadded_bytes_per_row as usize * height as usize);
+        {
+            let mapped = slice.get_mapped_range();
+            for row in mapped.chunks_exact(bytes_per_row as usize) {
+                rgba.extend_from_slice(&row[..unpadded_bytes_per_row as usize]);
+            }
+        }
+        buffer.unmap();
+        if swap_red_blue {
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        Ok(CapturedFrame {
+            width,
+            height,
+            rgba,
         })
     }
 
@@ -1405,6 +1530,13 @@ impl WgpuRenderer {
             log::error!("{error:#}");
             self.resources().queue.submit(std::iter::empty());
             return false;
+        }
+
+        if std::mem::take(&mut self.capture_requested) {
+            match self.read_back_frame(&frame.texture) {
+                Ok(captured) => self.captured_frame = Some(captured),
+                Err(error) => log::error!("frame capture failed: {error:#}"),
+            }
         }
 
         frame.present();

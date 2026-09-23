@@ -483,13 +483,34 @@ struct FrameCache {
     used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct LineLayoutIndex {
     font_generation: usize,
     lines_index: usize,
     wrapped_lines_index: usize,
     lines_by_hash_index: usize,
     wrapped_lines_by_hash_index: usize,
+}
+
+impl LineLayoutIndex {
+    /// Moves an index recorded inside a replayed range from its position in the
+    /// previous frame (`old`) to the corresponding position in the new frame
+    /// (`new`). Layouts are only carried forward within one font generation, so
+    /// an index from another generation is left to fail its generation check.
+    pub(crate) fn rebase(&mut self, old: &Self, new: &Self) {
+        if self.font_generation != old.font_generation || old.font_generation != new.font_generation
+        {
+            return;
+        }
+        self.lines_index = self.lines_index - old.lines_index + new.lines_index;
+        self.wrapped_lines_index =
+            self.wrapped_lines_index - old.wrapped_lines_index + new.wrapped_lines_index;
+        self.lines_by_hash_index =
+            self.lines_by_hash_index - old.lines_by_hash_index + new.lines_by_hash_index;
+        self.wrapped_lines_by_hash_index = self.wrapped_lines_by_hash_index
+            - old.wrapped_lines_by_hash_index
+            + new.wrapped_lines_by_hash_index;
+    }
 }
 
 impl LineLayoutCache {
