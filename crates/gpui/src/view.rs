@@ -47,6 +47,14 @@ impl AnyView {
         self.into_element().cached(style)
     }
 
+    /// Embed this view as a cached subtree whose children invalidate independently.
+    pub fn cached_with_independent_children(
+        self,
+        style: StyleRefinement,
+    ) -> ViewElement<AnyView> {
+        ViewElement::new(self).cached_with_independent_children(style)
+    }
+
     /// Convert this to a weak handle.
     pub fn downgrade(&self) -> AnyWeakView {
         AnyWeakView {
@@ -269,6 +277,7 @@ pub struct ViewElement<V: View> {
     cached_style: Option<StyleRefinement>,
     #[cfg(feature = "profiler")]
     view_type_name: &'static str,
+    independent_children: bool,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -291,6 +300,7 @@ impl<V: View> ViewElement<V> {
             cached_style: None,
             #[cfg(feature = "profiler")]
             view_type_name,
+            independent_children: false,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -308,6 +318,13 @@ impl<V: View> ViewElement<V> {
     /// entity-backed by construction.
     pub(crate) fn cached(mut self, style: StyleRefinement) -> Self {
         self.cached_style = Some(style);
+        self.independent_children = false;
+        self
+    }
+
+    pub(crate) fn cached_with_independent_children(mut self, style: StyleRefinement) -> Self {
+        self.cached_style = Some(style);
+        self.independent_children = true;
         self
     }
 }
@@ -319,6 +336,8 @@ struct ViewElementState {
     /// The entities the view accessed while it was last drawn, in any phase,
     /// restored when its prepaint is reused so the window stays subscribed.
     accessed_entities: FxHashSet<EntityId>,
+    refresh_descendants: bool,
+    independent_children: bool,
 }
 
 struct ViewElementCacheKey {
@@ -411,6 +430,7 @@ impl<V: View> Element for ViewElement<V> {
             let start = window.window_profiler.begin_view();
             let prepainted = prepaint_view(
                 entity_id,
+                self.independent_children,
                 global_id,
                 bounds,
                 element,
@@ -448,6 +468,7 @@ impl<V: View> Element for ViewElement<V> {
             paint_view(
                 entity_id,
                 self.cached_style.is_some(),
+                self.independent_children,
                 global_id,
                 element,
                 window,
@@ -518,6 +539,7 @@ fn request_layout_component(
 #[inline(never)]
 fn prepaint_view(
     entity_id: EntityId,
+    independent_children: bool,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -539,6 +561,16 @@ fn prepaint_view(
                 let text_style = window.text_style();
                 let opacity = window.element_opacity();
 
+                let refresh_descendants = !independent_children
+                    || window.refreshing
+                    || element_state.as_ref().is_none_or(|state| {
+                        state.independent_children != independent_children
+                            || state.cache_key.bounds != bounds
+                            || state.cache_key.content_mask != content_mask
+                            || state.cache_key.text_style != text_style
+                             || state.cache_key.opacity.to_bits() != opacity.to_bits()
+                    });
+
                 // Opacity is compared by bits so that a NaN opacity still matches itself
                 // and the view keeps using its cache.
                 if let Some(mut element_state) = element_state
@@ -548,6 +580,7 @@ fn prepaint_view(
                     && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
                     && !window.dirty_views.contains(&entity_id)
                     && !window.refreshing
+                    && element_state.independent_children == independent_children
                 {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -559,7 +592,7 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
-                let refreshing = mem::replace(&mut window.refreshing, true);
+                let refreshing = mem::replace(&mut window.refreshing, refresh_descendants);
                 let prepaint_start = window.prepaint_index();
                 let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                     let mut element = render(window, cx);
@@ -575,6 +608,8 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         accessed_entities,
+                        refresh_descendants,
+                        independent_children,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
                         cache_key: ViewElementCacheKey {
@@ -607,6 +642,7 @@ fn prepaint_component(
 fn paint_view(
     entity_id: EntityId,
     cached: bool,
+    independent_children: bool,
     global_id: Option<&GlobalElementId>,
     element: &mut Option<AnyElement>,
     window: &mut Window,
@@ -629,7 +665,10 @@ fn paint_view(
                     // actually painted, and output replayed under a different opacity is
                     // redrawn on the next frame.
                     if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        let refresh_descendants =
+                            !independent_children || window.refreshing || element_state.refresh_descendants;
+                        let refreshing = mem::replace(&mut window.refreshing, refresh_descendants);
+                        element.paint(window, cx);
                         let ((), accessed_entities) =
                             cx.detect_accessed_entities(|cx| element.paint(window, cx));
                         element_state.accessed_entities.extend(accessed_entities);
