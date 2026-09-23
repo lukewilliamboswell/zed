@@ -2267,6 +2267,14 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().renderer.as_ref()?.gpu_specs()
     }
 
+    fn request_frame_capture(&self) -> bool {
+        self.borrow_mut().renderer.request_frame_capture()
+    }
+
+    fn take_captured_frame(&self) -> Option<gpui::CapturedFrame> {
+        self.borrow_mut().renderer.take_captured_frame()
+    }
+
     fn play_system_bell(&self) {
         let state = self.borrow();
         let surface = if state.surface_state.toplevel().is_some() {
