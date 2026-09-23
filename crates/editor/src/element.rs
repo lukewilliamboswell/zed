@@ -11377,14 +11377,16 @@ fn layout_long_row(
             }
         })
     };
+    let fits = |shaped: &LineWithInvisibles, expected_width: ScrollPixelOffset| {
+        (ScrollPixelOffset::from(shaped.shaped_width()) - expected_width).abs()
+            <= GridCell::FIT_TOLERANCE
+    };
     let shape_to_width = |bytes: Range<u32>,
                           expected_width: ScrollPixelOffset,
                           window: &mut Window,
                           cx: &mut App| {
         let shaped = shape(bytes.clone(), true, window, cx);
-        if (ScrollPixelOffset::from(shaped.shaped_width()) - expected_width).abs()
-            <= GridCell::FIT_TOLERANCE
-        {
+        if fits(&shaped, expected_width) {
             shaped
         } else {
             shape(bytes, false, window, cx)
@@ -11401,22 +11403,32 @@ fn layout_long_row(
     } else {
         let ruled = snapshot.ruled_row(display_row, shaper);
         let columns = ruled.columns_for_viewport(&viewport, cell);
-        let mut chunks = ruled.chunk_columns(columns.clone());
-        let first_chunk = chunks.next().unwrap_or(0..0);
-        shaped = shape_to_width(
-            first_chunk.clone(),
-            ruled.chunk_width(first_chunk),
-            window,
-            cx,
-        );
-        for chunk in chunks {
-            shaped.append(shape_to_width(
-                chunk.clone(),
-                ruled.chunk_width(chunk),
-                window,
-                cx,
-            ));
-        }
+        let whole_window = cell
+            .monospace
+            .then(|| shape(columns.clone(), true, window, cx))
+            .filter(|whole_window| fits(whole_window, ruled.chunk_width(columns.clone())));
+        shaped = match whole_window {
+            Some(whole_window) => whole_window,
+            None => {
+                let mut chunks = ruled.chunk_columns(columns.clone());
+                let first_chunk = chunks.next().unwrap_or(0..0);
+                let mut shaped = shape_to_width(
+                    first_chunk.clone(),
+                    ruled.chunk_width(first_chunk),
+                    window,
+                    cx,
+                );
+                for chunk in chunks {
+                    shaped.append(shape_to_width(
+                        chunk.clone(),
+                        ruled.chunk_width(chunk),
+                        window,
+                        cx,
+                    ));
+                }
+                shaped
+            }
+        };
         geometry = WindowedRowGeometry::ruled(ruled, row_len, cell, columns);
     }
 
@@ -13772,6 +13784,7 @@ mod tests {
                         } else {
                             assert_eq!(geometry.window(), &(0..0));
                             assert!(!row_window.is_empty());
+                            assert_eq!(layout.fragments.len(), 1);
                         }
                         assert_eq!(
                             layout.shaped_start_index() + layout.shaped_len(),
@@ -13800,7 +13813,7 @@ mod tests {
                         {
                             let x = layout.x_for_index(index);
                             assert!(
-                                (x - row_layout.x_for_index(index)).abs() < 0.1,
+                                (x - row_layout.x_for_index(index)).abs() < shaping_tolerance,
                                 "{text:?} at {scroll_columns}: element and display map disagree at byte {index}"
                             );
                             assert!(

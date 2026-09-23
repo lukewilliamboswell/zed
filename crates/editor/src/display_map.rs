@@ -140,13 +140,30 @@ use crate::{
 };
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{Chunk, FoldPointCursor, FoldSnapshot};
-use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot};
+use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot, inlay_chunk_renderer};
 use itertools::Either;
 use row_ruler::RowRulerCache;
 pub use row_ruler::{RowRuler, RulerShaper};
 pub(crate) use tab_map::TabPoint;
 use tab_map::{TabPointCursor, TabSnapshot};
 use wrap_map::{WrapMap, WrapPatch, WrapPointCursor};
+
+const MAX_GRAPHEME_CHARS: usize = 64;
+
+fn is_grid_byte(byte: u8) -> bool {
+    (byte >= 0x20 && byte != 0x7f) || byte == b'\t' || byte == b'\n'
+}
+
+fn is_grid_char(char: char) -> bool {
+    char.is_ascii() && is_grid_byte(char as u8)
+}
+
+fn all_grid_bytes(bytes: &[u8]) -> bool {
+    let found_control = bytes.iter().fold(false, |found_control, byte| {
+        found_control | !is_grid_byte(*byte)
+    });
+    !found_control
+}
 
 const BULLETS: &str = match std::str::from_utf8(&[b'*'; rope::Chunk::MASK_BITS]) {
     Ok(bullets) => bullets,
@@ -254,6 +271,7 @@ pub struct DisplayMap {
     pub(crate) companion: Option<(WeakEntity<DisplayMap>, Entity<Companion>)>,
     lsp_folding_crease_ids: HashMap<BufferId, Vec<CreaseId>>,
     row_rulers: Arc<RowRulerCache>,
+    may_have_control_chars: bool,
 }
 
 pub(crate) struct Companion {
@@ -397,6 +415,9 @@ impl DisplayMap {
         // post-edit state, causing a desync.
         let buffer_snapshot = buffer.read(cx).snapshot(cx);
         let buffer_subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let may_have_control_chars = !buffer_snapshot
+            .bytes_in_range(MultiBufferOffset(0)..buffer_snapshot.len())
+            .all(all_grid_bytes);
         let crease_map = CreaseMap::new(&buffer_snapshot);
         let (inlay_map, snapshot) = InlayMap::new(buffer_snapshot);
         let (fold_map, snapshot) = FoldMap::new(snapshot);
@@ -426,7 +447,21 @@ impl DisplayMap {
             companion: None,
             lsp_folding_crease_ids: HashMap::default(),
             row_rulers: Arc::new(RowRulerCache::new(0, false, None)),
+            may_have_control_chars,
         }
+    }
+
+    fn consume_buffer_edits(
+        &mut self,
+        buffer: &MultiBufferSnapshot,
+    ) -> Vec<text::Edit<MultiBufferOffset>> {
+        let edits = self.buffer_subscription.consume().into_inner();
+        if !self.may_have_control_chars {
+            self.may_have_control_chars = edits
+                .iter()
+                .any(|edit| !buffer.bytes_in_range(edit.new.clone()).all(all_grid_bytes));
+        }
+        edits
     }
 
     pub(crate) fn set_companion(
@@ -467,10 +502,10 @@ impl DisplayMap {
 
         // Note, throwing away the wrap edits because we defer spacer computation to the first render.
         let snapshot = {
-            let edits = self.buffer_subscription.consume();
             let snapshot = self.buffer.read(cx).snapshot(cx);
+            let edits = self.consume_buffer_edits(&snapshot);
             let tab_size = Self::tab_size(&self.buffer, cx);
-            let (snapshot, edits) = self.inlay_map.sync(snapshot, edits.into_inner());
+            let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
             let (mut writer, snapshot, edits) = self.fold_map.write(snapshot, edits);
             let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
             let (_snapshot, _edits) = self
@@ -574,7 +609,7 @@ impl DisplayMap {
     fn sync_through_wrap(&mut self, cx: &mut App) -> (WrapSnapshot, WrapPatch) {
         let tab_size = Self::tab_size(&self.buffer, cx);
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&buffer_snapshot);
 
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
@@ -671,6 +706,7 @@ impl DisplayMap {
             display_map_id: self.entity_id,
             companion_display_snapshot,
             row_rulers: self.row_rulers_for(&block_snapshot),
+            may_have_control_chars: self.may_have_control_chars,
             block_snapshot,
             diagnostics_max_severity: self.diagnostics_max_severity,
             crease_snapshot: self.crease_map.snapshot(),
@@ -696,6 +732,7 @@ impl DisplayMap {
             display_map_id: self.entity_id,
             companion_display_snapshot: None,
             row_rulers: self.row_rulers_for(&block_snapshot),
+            may_have_control_chars: self.may_have_control_chars,
             block_snapshot,
             diagnostics_max_severity: self.diagnostics_max_severity,
             crease_snapshot: self.crease_map.snapshot(),
@@ -752,7 +789,7 @@ impl DisplayMap {
         }
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&buffer_snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot.clone(), edits);
@@ -827,7 +864,7 @@ impl DisplayMap {
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
@@ -861,7 +898,7 @@ impl DisplayMap {
             .into_iter()
             .map(|range| range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot))
             .collect::<Vec<_>>();
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
@@ -1284,7 +1321,7 @@ impl DisplayMap {
         cx: &mut Context<Self>,
     ) -> bool {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
@@ -1327,7 +1364,7 @@ impl DisplayMap {
             return;
         }
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&buffer_snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let companion_wrap_data = self.companion.as_ref().and_then(|(companion_dm, _)| {
@@ -1842,6 +1879,7 @@ pub struct DisplaySnapshot {
     pub crease_snapshot: CreaseSnapshot,
     block_snapshot: BlockSnapshot,
     row_rulers: Arc<RowRulerCache>,
+    may_have_control_chars: bool,
     text_highlights: TextHighlights,
     inlay_highlights: InlayHighlights,
     semantic_token_highlights: SemanticTokensHighlights,
@@ -2469,12 +2507,15 @@ impl DisplaySnapshot {
         cell.fits(&window, shaped.width).then_some((window, shaped))
     }
 
-    pub fn ruled_row(&self, display_row: DisplayRow, shaper: RulerShaper) -> RuledRow {
-        let wrap_row = self
-            .block_snapshot
+    fn wrap_row(&self, display_row: DisplayRow) -> u32 {
+        self.block_snapshot
             .to_wrap_point(DisplayPoint::new(display_row, 0).0, Bias::Left)
             .row()
-            .0;
+            .0
+    }
+
+    pub fn ruled_row(&self, display_row: DisplayRow, shaper: RulerShaper) -> RuledRow {
+        let wrap_row = self.wrap_row(display_row);
         let ruler = self
             .row_rulers
             .get_or_build(wrap_row, &shaper, |previous, renderer_widths| {
@@ -2504,10 +2545,15 @@ impl DisplaySnapshot {
         }
         let inlay_range = fold_range.start.to_inlay_point(fold_snapshot)
             ..fold_range.end.to_inlay_point(fold_snapshot);
-        let buffer_range = self.inlay_snapshot().to_buffer_point(inlay_range.start)
-            ..self.inlay_snapshot().to_buffer_point(inlay_range.end);
-        fold_snapshot.folds_in_range(buffer_range).next().is_none()
-            && !self.inlay_snapshot().has_rendered_inlays(inlay_range)
+        let inlay_snapshot = self.inlay_snapshot();
+        let buffer_range = inlay_snapshot.to_buffer_point(inlay_range.start)
+            ..inlay_snapshot.to_buffer_point(inlay_range.end);
+        !self.may_have_control_chars
+            && fold_snapshot.folds_in_range(buffer_range).next().is_none()
+            && !inlay_snapshot.has_inlays_matching(inlay_range, |inlay| {
+                inlay_chunk_renderer(inlay).is_some()
+                    || inlay.text().chars().any(|char| !is_grid_char(char))
+            })
     }
 
     #[instrument(skip_all)]
@@ -2565,19 +2611,19 @@ impl DisplaySnapshot {
     #[instrument(skip_all)]
     pub fn grapheme_at(&self, mut point: DisplayPoint) -> Option<SharedString> {
         point = DisplayPoint(self.block_snapshot.clip_point(point.0, Bias::Left));
-        let chars = self
+        let mut grapheme = String::new();
+        for char in self
             .text_chunks_from(point)
             .flat_map(str::chars)
-            .take_while({
-                let mut prev = false;
-                move |char| {
-                    let now = char.is_ascii();
-                    let end = char.is_ascii() && (char.is_ascii_whitespace() || prev);
-                    prev = now;
-                    !end
-                }
-            });
-        chars.collect::<String>().graphemes(true).next().map(|s| {
+            .take(MAX_GRAPHEME_CHARS)
+        {
+            grapheme.push(char);
+            if let Some((next_grapheme_start, _)) = grapheme.grapheme_indices(true).nth(1) {
+                grapheme.truncate(next_grapheme_start);
+                break;
+            }
+        }
+        grapheme.graphemes(true).next().map(|s| {
             if let Some(invisible) = s.chars().next().filter(|&c| is_invisible(c)) {
                 replacement(invisible).map_or_else(|| s.to_owned().into(), SharedString::from)
             } else if s == "\n" {
@@ -4022,13 +4068,14 @@ pub mod tests {
 
         let long_len = MAX_LINE_LEN * 2;
         let text = format!(
-            "{}\n{}\t{}\n{}\nshort\n{}\n{}",
+            "{}\n{}\t{}\n{}\nshort\n{}\n{}\n{}",
             "x".repeat(long_len),
             "x".repeat(30),
             "y".repeat(long_len),
             "é".repeat(long_len),
             "f".repeat(long_len),
-            "r".repeat(long_len)
+            "r".repeat(long_len),
+            "c".repeat(long_len)
         );
         let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
         let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
@@ -4069,6 +4116,12 @@ pub mod tests {
                         buffer_snapshot.anchor_after(MultiBufferOffset(repl_row_start + 5)),
                         "result",
                     ),
+                    Inlay::mock_hint(
+                        2,
+                        buffer_snapshot
+                            .anchor_after(MultiBufferOffset(text.find("ccc").unwrap() + 5)),
+                        "\u{2}",
+                    ),
                 ],
                 cx,
             );
@@ -4083,11 +4136,48 @@ pub mod tests {
         assert!(!snapshot.is_windowed_row(DisplayRow(4), monospace));
         assert!(!snapshot.is_windowed_row(DisplayRow(5), monospace));
 
-        let mut masked = snapshot.clone();
+        assert!(snapshot.is_long_unwrapped_row(DisplayRow(6)));
+        assert!(!snapshot.is_windowed_row(DisplayRow(6), monospace));
+
+        let mut masked = snapshot;
         masked.masked = true;
         assert!(!masked.is_long_unwrapped_row(DisplayRow(0)));
         assert!(!masked.is_long_unwrapped_row(DisplayRow(2)));
-        assert!(!snapshot.is_windowed_row(DisplayRow(6), monospace));
+    }
+
+    #[gpui::test]
+    async fn test_control_characters_disable_the_exact_grid(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+        let monospace = GridCell {
+            width: px(10.),
+            monospace: true,
+        };
+
+        let text = format!("{}\u{1}{}", "x".repeat(1_000), "x".repeat(3_000));
+        let snapshot = build_snapshot(&text, cx);
+        assert!(snapshot.is_long_unwrapped_row(DisplayRow(0)));
+        assert!(!snapshot.is_windowed_row(DisplayRow(0), monospace));
+
+        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
+        cx.set_state(&format!("ˇ{}\nshort", "x".repeat(MAX_LINE_LEN * 2)));
+        let is_grid = |cx: &mut crate::test::editor_test_context::EditorTestContext| {
+            cx.update_editor(|editor, window, cx| {
+                editor
+                    .snapshot(window, cx)
+                    .is_windowed_row(DisplayRow(0), monospace)
+            })
+        };
+        assert!(is_grid(&mut cx));
+
+        cx.update_editor(|editor, _, cx| {
+            editor.edit([(Point::new(1, 0)..Point::new(1, 0), "\u{7f}")], cx);
+        });
+        assert!(!is_grid(&mut cx));
+
+        cx.update_editor(|editor, _, cx| {
+            editor.edit([(Point::new(1, 0)..Point::new(1, 1), "")], cx);
+        });
+        assert!(!is_grid(&mut cx));
     }
 
     #[gpui::test]

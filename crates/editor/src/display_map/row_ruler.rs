@@ -4,7 +4,7 @@ use collections::{FxHasher, HashMap};
 use gpui::{Font, LineLayout, Pixels, SharedString, WindowTextSystem};
 use language::LanguageAwareStyling;
 use parking_lot::Mutex;
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 use crate::{
     EditorStyle,
@@ -16,6 +16,7 @@ use crate::{
 };
 
 const CHUNK_LEN: u32 = 2_048;
+const MAX_CHUNK_LEN: u32 = 4 * CHUNK_LEN;
 const REUSE_MARGIN: u32 = 64;
 
 #[derive(Clone)]
@@ -416,6 +417,12 @@ fn chunk_row_text(
         let mut end = stretch_end.min(position + CHUNK_LEN);
         if end < stretch_end {
             end = boundaries.at_or_after(end).min(stretch_end);
+            if end > position + MAX_CHUNK_LEN {
+                end = position + MAX_CHUNK_LEN;
+                while !text.is_char_boundary(end as usize) {
+                    end += 1;
+                }
+            }
         }
         let chunk_text = &text[position as usize..end as usize];
         chunks.push(RulerChunk {
@@ -454,35 +461,56 @@ fn chunk_hash(
     ))
 }
 
-struct GraphemeBoundaries {
-    len: u32,
-    bits: Option<Vec<u64>>,
+const REGIONAL_INDICATOR_PREFIX: &[u8] = b"\xF0\x9F\x87";
+
+enum GraphemeBoundaries<'a> {
+    Ascii { len: u32 },
+    Segmented { text: &'a str },
+    Indexed { len: u32, bits: Vec<u64> },
 }
 
-impl GraphemeBoundaries {
-    fn new(text: &str) -> Self {
+impl<'a> GraphemeBoundaries<'a> {
+    fn new(text: &'a str) -> Self {
         let len = text.len() as u32;
         if text.is_ascii() {
-            return Self { len, bits: None };
+            return Self::Ascii { len };
+        }
+        let bytes = text.as_bytes();
+        let has_regional_indicators = bytes.contains(&REGIONAL_INDICATOR_PREFIX[0])
+            && bytes
+                .windows(REGIONAL_INDICATOR_PREFIX.len())
+                .any(|window| window == REGIONAL_INDICATOR_PREFIX);
+        if !has_regional_indicators {
+            return Self::Segmented { text };
         }
         let mut bits = vec![0u64; text.len() / 64 + 1];
         for (offset, _) in text.grapheme_indices(true) {
             bits[offset / 64] |= 1 << (offset % 64);
         }
         bits[text.len() / 64] |= 1 << (text.len() % 64);
-        Self {
-            len,
-            bits: Some(bits),
+        Self::Indexed { len, bits }
+    }
+
+    fn len(&self) -> u32 {
+        match self {
+            Self::Ascii { len } | Self::Indexed { len, .. } => *len,
+            Self::Segmented { text } => text.len() as u32,
         }
     }
 
     fn is_boundary(&self, offset: u32) -> bool {
-        if offset > self.len {
+        if offset > self.len() {
             return false;
         }
-        match &self.bits {
-            None => true,
-            Some(bits) => {
+        match self {
+            Self::Ascii { .. } => true,
+            Self::Segmented { text } => {
+                let offset = offset as usize;
+                text.is_char_boundary(offset)
+                    && GraphemeCursor::new(offset, text.len(), true).is_boundary(text, 0)
+                        == Ok(true)
+            }
+            Self::Indexed { bits, .. } => {
                 let offset = offset as usize;
                 bits[offset / 64] & (1 << (offset % 64)) != 0
             }
@@ -490,17 +518,35 @@ impl GraphemeBoundaries {
     }
 
     fn at_or_after(&self, offset: u32) -> u32 {
-        let Some(bits) = &self.bits else {
-            return offset.min(self.len);
-        };
-        let offset = offset.min(self.len) as usize;
-        let mut word_ix = offset / 64;
-        let mut word = bits[word_ix] & (u64::MAX << (offset % 64));
-        while word == 0 {
-            word_ix += 1;
-            word = bits[word_ix];
+        let offset = offset.min(self.len());
+        match self {
+            Self::Ascii { .. } => offset,
+            Self::Segmented { text } => {
+                let mut boundary = offset as usize;
+                while !text.is_char_boundary(boundary) {
+                    boundary += 1;
+                }
+                let mut cursor = GraphemeCursor::new(boundary, text.len(), true);
+                if cursor.is_boundary(text, 0) == Ok(true) {
+                    return boundary as u32;
+                }
+                cursor
+                    .next_boundary(text, 0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(text.len()) as u32
+            }
+            Self::Indexed { bits, .. } => {
+                let offset = offset as usize;
+                let mut word_ix = offset / 64;
+                let mut word = bits[word_ix] & (u64::MAX << (offset % 64));
+                while word == 0 {
+                    word_ix += 1;
+                    word = bits[word_ix];
+                }
+                (word_ix * 64 + word.trailing_zeros() as usize) as u32
+            }
         }
-        (word_ix * 64 + word.trailing_zeros() as usize) as u32
     }
 }
 
@@ -703,6 +749,34 @@ mod tests {
             }
         }
         assert!((reused.width() - fresh.width()).abs() < fresh.width() * 1e-6);
+    }
+
+    #[gpui::test]
+    async fn test_ruler_caps_oversized_grapheme_clusters(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        let text = format!("a{}", "\u{301}".repeat(20_000));
+        cx.set_state(&format!("ˇ{text}"));
+        let (snapshot, details) = cx.update_editor(|editor, window, cx| {
+            (
+                editor.snapshot(window, cx).display_snapshot,
+                editor.text_layout_details(window, cx),
+            )
+        });
+        let shaper = details.ruler_shaper();
+        let ruler = RowRuler::new(&snapshot, DisplayRow(0), &shaper, None, &HashMap::default());
+        assert_eq!(ruler.len(), text.len() as u32);
+        assert!(ruler.chunks.len() >= 4);
+        for chunk in &ruler.chunks {
+            assert!(
+                chunk.len <= MAX_CHUNK_LEN + 4,
+                "chunk of {} bytes",
+                chunk.len
+            );
+        }
+        for boundary in &ruler.starts {
+            assert!(text.is_char_boundary(*boundary as usize));
+        }
     }
 
     #[gpui::test]
