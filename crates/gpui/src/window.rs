@@ -720,8 +720,12 @@ pub struct DismissEvent;
 
 type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
-pub(crate) type AnyMouseListener =
-    Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
+pub(crate) struct AnyMouseListener {
+    /// A listener owned by a hitbox only acts on pointer motion when that
+    /// hitbox is, or just was, under the pointer. See [`Window::on_hitbox_pointer_motion`].
+    hitbox_id: Option<HitboxId>,
+    handler: Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>,
+}
 
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
@@ -982,6 +986,10 @@ pub(crate) struct Frame {
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     cached_view_replays: Vec<CachedViewReplay>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    /// Indices of mouse listeners that receive every mouse event.
+    unowned_mouse_listeners: Vec<usize>,
+    /// Indices of pointer-motion listeners, by the hitbox that owns them.
+    pub(crate) hitbox_mouse_listeners: FxHashMap<HitboxId, SmallVec<[usize; 2]>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
@@ -1111,6 +1119,8 @@ impl Frame {
             accessed_element_states: Vec::new(),
             cached_view_replays: Vec::new(),
             mouse_listeners: Vec::new(),
+            unowned_mouse_listeners: Vec::new(),
+            hitbox_mouse_listeners: FxHashMap::default(),
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
@@ -1139,6 +1149,8 @@ impl Frame {
         self.accessed_element_states.clear();
         self.cached_view_replays.clear();
         self.mouse_listeners.clear();
+        self.unowned_mouse_listeners.clear();
+        self.hitbox_mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
@@ -1200,6 +1212,53 @@ impl Frame {
             hit_test.hover_hitbox_count = hit_test.ids.len();
         }
         hit_test
+    }
+
+    fn push_mouse_listener(&mut self, listener: Option<AnyMouseListener>) {
+        let index = self.mouse_listeners.len();
+        if let Some(listener) = listener.as_ref() {
+            match listener.hitbox_id {
+                Some(hitbox_id) => self
+                    .hitbox_mouse_listeners
+                    .entry(hitbox_id)
+                    .or_default()
+                    .push(index),
+                None => self.unowned_mouse_listeners.push(index),
+            }
+        }
+        self.mouse_listeners.push(listener);
+    }
+
+    /// The listeners, in registration order, that a pointer-motion event must
+    /// reach: every unowned listener and those owned by the given hitboxes.
+    pub(crate) fn pointer_motion_listeners(&self, hitboxes: &[HitboxId]) -> Vec<usize> {
+        let mut routes: SmallVec<[&[usize]; 16]> = SmallVec::new();
+        routes.push(&self.unowned_mouse_listeners);
+        for hitbox_id in hitboxes {
+            if let Some(indices) = self.hitbox_mouse_listeners.get(hitbox_id) {
+                routes.push(indices);
+            }
+        }
+        let mut positions: SmallVec<[usize; 16]> = smallvec::smallvec![0; routes.len()];
+        let mut listeners = Vec::new();
+        loop {
+            let next = routes
+                .iter()
+                .zip(&positions)
+                .filter_map(|(route, &position)| route.get(position))
+                .copied()
+                .min();
+            let Some(next) = next else { break };
+            if listeners.last() != Some(&next) {
+                listeners.push(next);
+            }
+            for (route, position) in routes.iter().zip(&mut positions) {
+                if route.get(*position) == Some(&next) {
+                    *position += 1;
+                }
+            }
+        }
+        listeners
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -1333,7 +1392,7 @@ pub struct Window {
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
-    mouse_hit_test: HitTest,
+    pub(crate) mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -4043,12 +4102,11 @@ impl Window {
                 .iter_mut()
                 .map(|handler| handler.take()),
         );
-        self.next_frame.mouse_listeners.extend(
-            self.rendered_frame.mouse_listeners
-                [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
-                .iter_mut()
-                .map(|listener| listener.take()),
-        );
+        for listener in &mut self.rendered_frame.mouse_listeners
+            [range.start.mouse_listeners_index..range.end.mouse_listeners_index]
+        {
+            self.next_frame.push_mouse_listener(listener.take());
+        }
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
                 ..range.end.accessed_element_states_index]
@@ -5407,13 +5465,45 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.mouse_listeners.push(Some(Box::new(
-            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
-                    listener(event, phase, window, cx)
-                }
-            },
-        )));
+        self.next_frame.push_mouse_listener(Some(AnyMouseListener {
+            hitbox_id: None,
+            handler: Box::new(
+                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                    if let Some(event) = event.downcast_ref() {
+                        listener(event, phase, window, cx)
+                    }
+                },
+            ),
+        }));
+    }
+
+    /// Register a pointer-motion listener that only has an effect while the
+    /// given hitbox is, or has just stopped being, under the pointer: a hover
+    /// or drag-threshold handler, for example.
+    ///
+    /// Motion without a pressed button, active drag or pointer capture is
+    /// delivered only to the listeners of hitboxes under the pointer before or
+    /// after the move, so that a window with many such elements does not visit
+    /// every one of them. All other mouse events, including motion while a
+    /// button is held, reach the listener as they would through
+    /// [`Self::on_mouse_event`]. Registration order is preserved.
+    pub(crate) fn on_hitbox_pointer_motion<Event: MouseEvent>(
+        &mut self,
+        hitbox_id: HitboxId,
+        mut listener: impl FnMut(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        self.next_frame.push_mouse_listener(Some(AnyMouseListener {
+            hitbox_id: Some(hitbox_id),
+            handler: Box::new(
+                move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                    if let Some(event) = event.downcast_ref() {
+                        listener(event, phase, window, cx)
+                    }
+                },
+            ),
+        }));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -5901,10 +5991,13 @@ impl Window {
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
-        if hit_test != self.mouse_hit_test {
-            self.mouse_hit_test = hit_test;
+        let previous_hit_test = if hit_test != self.mouse_hit_test {
+            let previous = mem::replace(&mut self.mouse_hit_test, hit_test);
             self.reset_cursor_style(cx);
-        }
+            Some(previous)
+        } else {
+            None
+        };
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {
@@ -5913,13 +6006,42 @@ impl Window {
             return;
         }
 
+        // Free pointer motion only concerns the hitboxes under the pointer
+        // before and after the move. Pressed motion, drags and pointer capture
+        // can concern any element, so they, like every other event, reach all
+        // listeners.
+        let routed = match event.downcast_ref::<MouseMoveEvent>() {
+            Some(event) => {
+                event.pressed_button.is_none()
+                    && !cx.has_active_drag()
+                    && self.captured_hitbox.is_none()
+            }
+            None => event.is::<crate::MouseExitEvent>() && self.captured_hitbox.is_none(),
+        };
+        let routed_listeners = routed.then(|| {
+            let mut hitboxes: SmallVec<[HitboxId; 16]> =
+                self.mouse_hit_test.ids.iter().copied().collect();
+            if let Some(previous) = &previous_hit_test {
+                hitboxes.extend(previous.ids.iter().copied());
+            }
+            self.rendered_frame.pointer_motion_listeners(&hitboxes)
+        });
+
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
+        let listener_count = mouse_listeners.len();
+        let listener_at = |position: usize| match &routed_listeners {
+            Some(indices) => indices[position],
+            None => position,
+        };
+        let dispatched = routed_listeners
+            .as_ref()
+            .map_or(listener_count, |indices| indices.len());
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
         // special purposes, such as detecting events outside of a given Bounds.
-        for listener in &mut mouse_listeners {
-            let listener = listener.as_mut().unwrap();
-            listener(event, DispatchPhase::Capture, self, cx);
+        for position in 0..dispatched {
+            let listener = mouse_listeners[listener_at(position)].as_mut().unwrap();
+            (listener.handler)(event, DispatchPhase::Capture, self, cx);
             if !cx.propagate_event {
                 break;
             }
@@ -5927,9 +6049,9 @@ impl Window {
 
         // Bubble phase, where most normal handlers do their work.
         if cx.propagate_event {
-            for listener in mouse_listeners.iter_mut().rev() {
-                let listener = listener.as_mut().unwrap();
-                listener(event, DispatchPhase::Bubble, self, cx);
+            for position in (0..dispatched).rev() {
+                let listener = mouse_listeners[listener_at(position)].as_mut().unwrap();
+                (listener.handler)(event, DispatchPhase::Bubble, self, cx);
                 if !cx.propagate_event {
                     break;
                 }
