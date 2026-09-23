@@ -980,6 +980,7 @@ pub(crate) struct Frame {
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    cached_view_replays: Vec<CachedViewReplay>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -1002,6 +1003,7 @@ pub(crate) struct Frame {
 
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
+    cached_view_replays_index: usize,
     hitboxes_index: usize,
     tooltips_index: usize,
     deferred_draws_index: usize,
@@ -1010,7 +1012,7 @@ pub(crate) struct PrepaintStateIndex {
     line_layout_index: LineLayoutIndex,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
     #[cfg(any(test, feature = "test-support"))]
@@ -1023,7 +1025,78 @@ pub(crate) struct PaintIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+/// A cached view range replayed from the previous frame at a different
+/// position. Cached views nested inside the range were skipped, so their stored
+/// ranges still describe the previous frame and are relocated in
+/// [`Frame::finish`].
+enum CachedViewReplay {
+    Prepaint {
+        old: PrepaintStateIndex,
+        new: PrepaintStateIndex,
+        accessed_end: usize,
+    },
+    Paint {
+        old: PaintIndex,
+        new: PaintIndex,
+        accessed_end: usize,
+    },
+}
+
+impl PrepaintStateIndex {
+    fn same_replay_origin(&self, other: &Self) -> bool {
+        // The replay-log cursor is frame-local bookkeeping, not a replayed index.
+        self.hitboxes_index == other.hitboxes_index
+            && self.tooltips_index == other.tooltips_index
+            && self.deferred_draws_index == other.deferred_draws_index
+            && self.dispatch_tree_index == other.dispatch_tree_index
+            && self.accessed_element_states_index == other.accessed_element_states_index
+            && self.line_layout_index == other.line_layout_index
+    }
+
+    fn rebase(&mut self, old: &Self, new: &Self) {
+        self.hitboxes_index = self.hitboxes_index - old.hitboxes_index + new.hitboxes_index;
+        self.tooltips_index = self.tooltips_index - old.tooltips_index + new.tooltips_index;
+        self.deferred_draws_index =
+            self.deferred_draws_index - old.deferred_draws_index + new.deferred_draws_index;
+        self.dispatch_tree_index =
+            self.dispatch_tree_index - old.dispatch_tree_index + new.dispatch_tree_index;
+        self.accessed_element_states_index = self.accessed_element_states_index
+            - old.accessed_element_states_index
+            + new.accessed_element_states_index;
+        self.line_layout_index
+            .rebase(&old.line_layout_index, &new.line_layout_index);
+    }
+}
+
+impl PaintIndex {
+    fn rebase(&mut self, old: &Self, new: &Self) {
+        self.scene_index = self.scene_index - old.scene_index + new.scene_index;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.debug_bounds_index =
+                self.debug_bounds_index - old.debug_bounds_index + new.debug_bounds_index;
+        }
+        self.mouse_listeners_index =
+            self.mouse_listeners_index - old.mouse_listeners_index + new.mouse_listeners_index;
+        self.input_handlers_index =
+            self.input_handlers_index - old.input_handlers_index + new.input_handlers_index;
+        self.cursor_styles_index =
+            self.cursor_styles_index - old.cursor_styles_index + new.cursor_styles_index;
+        self.accessed_element_states_index = self.accessed_element_states_index
+            - old.accessed_element_states_index
+            + new.accessed_element_states_index;
+        self.tab_handle_index = self.tab_handle_index - old.tab_handle_index + new.tab_handle_index;
+        self.line_layout_index
+            .rebase(&old.line_layout_index, &new.line_layout_index);
+    }
+}
+
 impl Frame {
+    #[cfg(test)]
+    pub(crate) fn cached_view_replay_count(&self) -> usize {
+        self.cached_view_replays.len()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_debug_bounds(&mut self, selector: String, bounds: Bounds<Pixels>) {
         self.debug_bounds.insert(selector.clone(), bounds);
@@ -1036,6 +1109,7 @@ impl Frame {
             window_active: false,
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
+            cached_view_replays: Vec::new(),
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
@@ -1063,6 +1137,7 @@ impl Frame {
     pub(crate) fn clear(&mut self) {
         self.element_states.clear();
         self.accessed_element_states.clear();
+        self.cached_view_replays.clear();
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
@@ -1134,6 +1209,7 @@ impl Frame {
     }
 
     pub(crate) fn finish(&mut self, prev_frame: &mut Self) {
+        self.relocate_replayed_view_states(prev_frame);
         for element_state_key in &self.accessed_element_states {
             if let Some((element_state_key, element_state)) =
                 prev_frame.element_states.remove_entry(element_state_key)
@@ -1143,6 +1219,64 @@ impl Frame {
         }
 
         self.scene.finish();
+    }
+
+    /// Cached views nested inside a replayed range were not visited this frame,
+    /// so the ranges they stored still index the previous frame. Relocate them
+    /// to the new frame before their state migrates. This runs only after every
+    /// prepaint transaction has settled, and only touches states the previous
+    /// frame still owns: a view visited this frame has already moved its state.
+    fn relocate_replayed_view_states(&mut self, prev_frame: &mut Self) {
+        let view_state = TypeId::of::<crate::view::ViewElementState>();
+        let mut prepaint_relocated = FxHashSet::default();
+        let mut paint_relocated = FxHashSet::default();
+        for replay in &self.cached_view_replays {
+            let (start, end, relocated) = match replay {
+                CachedViewReplay::Prepaint {
+                    new, accessed_end, ..
+                } => (
+                    new.accessed_element_states_index,
+                    *accessed_end,
+                    &mut prepaint_relocated,
+                ),
+                CachedViewReplay::Paint {
+                    new, accessed_end, ..
+                } => (
+                    new.accessed_element_states_index,
+                    *accessed_end,
+                    &mut paint_relocated,
+                ),
+            };
+            for key in &self.accessed_element_states[start..end] {
+                // A range replayed inside another replayed range lists the same
+                // nested view twice; relocate each state once per phase.
+                if key.1 != view_state || !relocated.insert(key) {
+                    continue;
+                }
+                let Some(state) = prev_frame
+                    .element_states
+                    .get_mut(key)
+                    .and_then(|state| {
+                        state
+                            .inner
+                            .downcast_mut::<Option<crate::view::ViewElementState>>()
+                    })
+                    .and_then(Option::as_mut)
+                else {
+                    continue;
+                };
+                match replay {
+                    CachedViewReplay::Prepaint { old, new, .. } => {
+                        state.prepaint_range.start.rebase(old, new);
+                        state.prepaint_range.end.rebase(old, new);
+                    }
+                    CachedViewReplay::Paint { old, new, .. } => {
+                        state.paint_range.start.rebase(old, new);
+                        state.paint_range.end.rebase(old, new);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3802,6 +3936,7 @@ impl Window {
 
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
+            cached_view_replays_index: self.next_frame.cached_view_replays.len(),
             hitboxes_index: self.next_frame.hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
@@ -3812,6 +3947,7 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        let new_start = self.prepaint_index();
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -3829,6 +3965,15 @@ impl Window {
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
         );
+        if !range.start.same_replay_origin(&new_start) {
+            self.next_frame
+                .cached_view_replays
+                .push(CachedViewReplay::Prepaint {
+                    old: range.start.clone(),
+                    new: new_start,
+                    accessed_end: self.next_frame.accessed_element_states.len(),
+                });
+        }
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
 
@@ -3877,6 +4022,7 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        let new_start = self.paint_index();
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records
@@ -3909,6 +4055,15 @@ impl Window {
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
         );
+        if range.start != new_start {
+            self.next_frame
+                .cached_view_replays
+                .push(CachedViewReplay::Paint {
+                    old: range.start.clone(),
+                    new: new_start,
+                    accessed_end: self.next_frame.accessed_element_states.len(),
+                });
+        }
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
@@ -4068,6 +4223,9 @@ impl Window {
             self.next_frame
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
+            self.next_frame
+                .cached_view_replays
+                .truncate(index.cached_view_replays_index);
             self.text_system.truncate_layouts(index.line_layout_index);
         }
         result
