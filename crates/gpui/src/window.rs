@@ -2976,6 +2976,20 @@ impl Window {
             .retain(&(), |callback| callback(self, cx));
     }
 
+    /// Ask for the next presented frame to be read back. Scheduling that frame
+    /// is the caller's business, so a capture does not force a refresh that
+    /// bypasses view caches. Returns false when this platform's renderer
+    /// cannot read back.
+    pub fn request_frame_capture(&self) -> bool {
+        self.platform_window.request_frame_capture()
+    }
+
+    /// The frame read back after [`Self::request_frame_capture`], once one has
+    /// been presented.
+    pub fn take_captured_frame(&self) -> Option<crate::CapturedFrame> {
+        self.platform_window.take_captured_frame()
+    }
+
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.platform_window.bounds()
