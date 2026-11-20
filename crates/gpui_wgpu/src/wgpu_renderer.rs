@@ -631,7 +631,9 @@ impl WgpuRenderer {
         );
         let mut rgba = Vec::with_capacity(unpadded_bytes_per_row as usize * height as usize);
         {
-            let mapped = slice.get_mapped_range();
+            let mapped = slice
+                .get_mapped_range()
+                .context("reading mapped frame capture")?;
             for row in mapped.chunks_exact(bytes_per_row as usize) {
                 rgba.extend_from_slice(&row[..unpadded_bytes_per_row as usize]);
             }
