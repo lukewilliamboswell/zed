@@ -666,7 +666,6 @@ fn paint_view(
                             || window.refreshing
                             || element_state.refresh_descendants;
                         let refreshing = mem::replace(&mut window.refreshing, refresh_descendants);
-                        element.paint(window, cx);
                         let ((), accessed_entities) =
                             cx.detect_accessed_entities(|cx| element.paint(window, cx));
                         element_state.accessed_entities.extend(accessed_entities);
