@@ -524,11 +524,6 @@ impl LineLayoutIndex {
         self.lines_index = self.lines_index - old.lines_index + new.lines_index;
         self.wrapped_lines_index =
             self.wrapped_lines_index - old.wrapped_lines_index + new.wrapped_lines_index;
-        self.lines_by_hash_index =
-            self.lines_by_hash_index - old.lines_by_hash_index + new.lines_by_hash_index;
-        self.wrapped_lines_by_hash_index = self.wrapped_lines_by_hash_index
-            - old.wrapped_lines_by_hash_index
-            + new.wrapped_lines_by_hash_index;
     }
 }
 
