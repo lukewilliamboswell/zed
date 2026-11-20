@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Bounds, CapturedFrame, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
-    Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
+    AtlasTextureId, Bounds, CapturedFrame, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch,
+    ScaledPixels, Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -504,7 +504,10 @@ impl WgpuRenderer {
             surface.configure(&context.device, &surface_config);
         }
 
-        let supports_frame_capture = surface.get_capabilities(&context.adapter).usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let supports_frame_capture = surface
+            .get_capabilities(&context.adapter)
+            .usages
+            .contains(wgpu::TextureUsages::COPY_SRC);
         let surface_format = surface_config.format;
         let alpha_mode = surface_config.alpha_mode;
         let max_texture_size = context.device.limits().max_texture_dimension_2d;
@@ -536,7 +539,9 @@ impl WgpuRenderer {
     /// presentation-only swapchain. Returns false when the surface cannot be
     /// a copy source.
     pub fn request_frame_capture(&mut self) -> bool {
-        let RendererState::Ready { surface, core } = &mut self.state else { return false; };
+        let RendererState::Ready { surface, core } = &mut self.state else {
+            return false;
+        };
         if !self.supports_frame_capture {
             return false;
         }
@@ -561,7 +566,10 @@ impl WgpuRenderer {
 
     /// Copy the rendered surface texture to the CPU. This waits for the GPU;
     /// it runs only for a frame someone asked to photograph.
-    fn read_back_frame(resources: &WgpuResources, texture: &wgpu::Texture) -> Result<CapturedFrame> {
+    fn read_back_frame(
+        resources: &WgpuResources,
+        texture: &wgpu::Texture,
+    ) -> Result<CapturedFrame> {
         let width = texture.width();
         let height = texture.height();
         let unpadded_bytes_per_row = width * 4;

@@ -573,7 +573,7 @@ fn prepaint_view(
                             || state.cache_key.bounds != bounds
                             || state.cache_key.content_mask != content_mask
                             || state.cache_key.text_style != text_style
-                             || state.cache_key.opacity.to_bits() != opacity.to_bits()
+                            || state.cache_key.opacity.to_bits() != opacity.to_bits()
                     });
 
                 // Opacity is compared by bits so that a NaN opacity still matches itself
