@@ -2268,11 +2268,17 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn request_frame_capture(&self) -> bool {
-        self.borrow_mut().renderer.request_frame_capture()
+        self.borrow_mut()
+            .renderer
+            .as_mut()
+            .is_some_and(WgpuRenderer::request_frame_capture)
     }
 
     fn take_captured_frame(&self) -> Option<gpui::CapturedFrame> {
-        self.borrow_mut().renderer.take_captured_frame()
+        self.borrow_mut()
+            .renderer
+            .as_mut()
+            .and_then(WgpuRenderer::take_captured_frame)
     }
 
     fn play_system_bell(&self) {

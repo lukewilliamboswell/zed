@@ -2012,11 +2012,21 @@ impl PlatformWindow for X11Window {
     }
 
     fn request_frame_capture(&self) -> bool {
-        self.0.state.borrow_mut().renderer.request_frame_capture()
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .as_mut()
+            .is_some_and(WgpuRenderer::request_frame_capture)
     }
 
     fn take_captured_frame(&self) -> Option<gpui::CapturedFrame> {
-        self.0.state.borrow_mut().renderer.take_captured_frame()
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .as_mut()
+            .and_then(WgpuRenderer::take_captured_frame)
     }
 
     fn play_system_bell(&self) {
